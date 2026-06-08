@@ -50,6 +50,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
         search.createColumn({ name:'item' }),
         search.createColumn({ name:'quantity' }),
         search.createColumn({ name:'custcol_rsm_sales_rep' }),
+        search.createColumn({ name:'custcol_tnd_commission' }),
         search.createColumn({
           name:'formulanumeric',
           formula:'{estgrossprofit}',
@@ -74,6 +75,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
       var item       = r.getValue({ name:'item' });
       var qty        = toNum(r.getValue({ name:'quantity' })) || 1;
       var rsm        = r.getValue({ name:'custcol_rsm_sales_rep' });
+      var tndManager = r.getValue({ name:'custcol_tnd_commission' });
 
       var amount     = toNum(r.getValue({ name:'formulanumeric' })) || 0;
 
@@ -91,7 +93,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
       }
 
       // no merging
-      rsmMap[rsm].lines.push({ item:item, qty:qty, rate:amount });
+      rsmMap[rsm].lines.push({ item:item, qty:qty, rate:amount, tndManager:tndManager });
 
       return true;
     });
@@ -133,6 +135,19 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
           inv.setCurrentSublistValue({ sublistId:'item', fieldId:'price', value: -1 }); // custom price
           inv.setCurrentSublistValue({ sublistId:'item', fieldId:'quantity', value: ln.qty });
           inv.setCurrentSublistValue({ sublistId:'item', fieldId:'rate', value: ln.rate });
+
+          // Pass T&D Manager from Rep Commission line to Invoice line
+          if (!isEmpty(ln.tndManager)) {
+            try {
+              inv.setCurrentSublistValue({
+                sublistId:'item',
+                fieldId:'custcol_tnd_commission',
+                value: parseInt(ln.tndManager,10)
+              });
+            } catch(eTnd) {
+              log.error('T&D MANAGER LINE SET ERROR', eTnd);
+            }
+          }
 
           // line location (safe)
           try { inv.setCurrentSublistValue({ sublistId:'item', fieldId:'location', value: parseInt(data.location,10) }); } catch(e){}
