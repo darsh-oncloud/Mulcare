@@ -55,7 +55,8 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
         search.createColumn({ name:'quantity' }),
         search.createColumn({ name:'custcol_rsm_sales_rep' }),
         search.createColumn({ name:'custcol_tnd_commission' }),
-        search.createColumn({ name:'custcol_td_manager' }),        
+        search.createColumn({ name:'custcol_td_manager' }),
+        search.createColumn({ name: 'amount' }),
         search.createColumn({
           name:'formulanumeric',
           formula:'{estgrossprofit}',
@@ -83,6 +84,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
       var tndManager = r.getValue({ name:'custcol_tnd_commission' });
       var tndSalesTeam = r.getValue({ name:'custcol_td_manager' });
       var amount     = toNum(r.getValue({ name:'formulanumeric' })) || 0;
+      var repSalesAmount = toNum(r.getValue({ name: 'amount' }));
 
       log.debug('LINE', { customer:customer, subsidiary:subsidiary, location:locationId, item:item, qty:qty, rsm:rsm,tndManager:tndManager,tndSalesTeam:tndSalesTeam, amount:amount });
 
@@ -102,7 +104,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
       }
 
       // no merging
-      rsmMap[rsm].lines.push({ item:item, qty:qty, rate:amount, tndManager:tndManager });
+      rsmMap[rsm].lines.push({ item:item, qty:qty, rate:amount, tndManager:tndManager, repSalesAmount: repSalesAmount });
 
       return true;
     });
@@ -146,6 +148,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
           inv.setCurrentSublistValue({ sublistId:'item', fieldId:'price', value: -1 }); // custom price
           inv.setCurrentSublistValue({ sublistId:'item', fieldId:'quantity', value: ln.qty });
           inv.setCurrentSublistValue({ sublistId:'item', fieldId:'rate', value: ln.rate });
+          inv.setCurrentSublistValue({ sublistId:'item', fieldId:'custcol_snp_rep_sales_amount', value: ln.repSalesAmount });
 
           // Pass T&D Manager from Rep Commission line to Invoice line
           if (!isEmpty(ln.tndManager)) {
