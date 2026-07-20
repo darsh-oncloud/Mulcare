@@ -14,6 +14,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
 
     var repRec = context.newRecord;
     var repId  = repRec.id;
+    var createdByEmployeeId = parseInt(runtime.getCurrentUser().id, 10);
 
     log.audit('START', 'Rep Commission ID: ' + repId);
 
@@ -120,6 +121,8 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
         var inv = record.create({ type: record.Type.INVOICE, isDynamic: true });
 
         inv.setValue({ fieldId:'entity', value: parseInt(data.customer,10) });
+
+        inv.setValue({ fieldId:'custbodypm_created_by', value: createdByEmployeeId });
 
         if (!isEmpty(data.subsidiary)) {
           try { inv.setValue({ fieldId:'subsidiary', value: parseInt(data.subsidiary,10) }); } catch(e){}
