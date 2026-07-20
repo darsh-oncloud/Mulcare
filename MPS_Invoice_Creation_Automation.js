@@ -10,6 +10,39 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
     return isNaN(n) ? 0 : n;
   }
 
+function getRsmAddressId(customerId, rsmId) {
+
+  var addressIdColumn = search.createColumn({
+    name: 'addressinternalid',
+    join: 'Address'
+  });
+
+  var results = search.create({
+    type: search.Type.CUSTOMER,
+    filters: [
+      ['internalidnumber', 'equalto', String(customerId)],
+      'AND',
+      ['address.custrecord_pm_reg_sales_mgr', 'anyof', String(rsmId)]
+    ],
+    columns: [addressIdColumn]
+  }).run().getRange({
+    start: 0,
+    end: 1
+  });
+
+  var addressId = results.length
+    ? results[0].getValue(addressIdColumn)
+    : '';
+
+  log.debug('RSM ADDRESS RESULT', {
+    customerId: customerId,
+    rsmId: rsmId,
+    addressId: addressId || 'No matching address'
+  });
+
+  return addressId;
+}
+  
   function onAction(context) {
 
     var repRec = context.newRecord;
@@ -124,6 +157,17 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
 
         inv.setValue({ fieldId:'entity', value: parseInt(data.customer,10) });
 
+var addressId = getRsmAddressId(data.customer, rsmId);
+
+// Set matching address; otherwise keep default shipping address
+if (!isEmpty(addressId)) {
+  inv.setValue({
+    fieldId: 'shipaddresslist',
+    value: String(addressId)
+  });
+}
+
+        
         inv.setValue({ fieldId:'custbodypm_created_by', value: createdByEmployeeId });
 
         if (!isEmpty(data.subsidiary)) {
