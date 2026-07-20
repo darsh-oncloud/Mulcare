@@ -20,6 +20,9 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
     var invoiceIds = [];
     var rsmMap = {};     // { rsmId: { customer, location, subsidiary, lines:[{item,qty,rate}] } }
     var invByRsm = {};   //  { rsmId : invoiceId }
+    
+    // NEW: collect T&D Manager employees for sales team
+    var tndSalesTeamMap = {};    
 
     //  NEW: get status from parameter
     var repCommissionStatus = runtime.getCurrentScript().getParameter({
@@ -51,6 +54,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
         search.createColumn({ name:'quantity' }),
         search.createColumn({ name:'custcol_rsm_sales_rep' }),
         search.createColumn({ name:'custcol_tnd_commission' }),
+        search.createColumn({ name:'custcol_td_manager' }),        
         search.createColumn({
           name:'formulanumeric',
           formula:'{estgrossprofit}',
@@ -76,11 +80,15 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
       var qty        = toNum(r.getValue({ name:'quantity' })) || 1;
       var rsm        = r.getValue({ name:'custcol_rsm_sales_rep' });
       var tndManager = r.getValue({ name:'custcol_tnd_commission' });
-
+      var tndSalesTeam = r.getValue({ name:'custcol_td_manager' });
       var amount     = toNum(r.getValue({ name:'formulanumeric' })) || 0;
 
-      log.debug('LINE', { customer:customer, subsidiary:subsidiary, location:locationId, item:item, qty:qty, rsm:rsm, amount:amount });
+      log.debug('LINE', { customer:customer, subsidiary:subsidiary, location:locationId, item:item, qty:qty, rsm:rsm,tndManager:tndManager,tndSalesTeam:tndSalesTeam, amount:amount });
 
+      if (!isEmpty(tndSalesTeam)) {
+        tndSalesTeamMap[tndSalesTeam] = true;
+      }
+      
       if (isEmpty(customer) || isEmpty(item) || isEmpty(rsm) || !amount) return true;
 
       if (!rsmMap[rsm]) {
@@ -99,7 +107,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
     });
 
     log.audit('GROUP RESULT', JSON.stringify(rsmMap));
-
+    log.audit('TND SALES TEAM RESULT', JSON.stringify(tndSalesTeamMap));
     // ======================================================
     // CREATE 1 INVOICE PER RSM
     // ======================================================
@@ -236,6 +244,16 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
         repEdit.setCurrentSublistValue({ sublistId:'salesteam', fieldId:'employee', value: parseInt(rsm3,10) });
         repEdit.commitLine({ sublistId:'salesteam' });
       }
+      // NEW: add T&D Manager employees with 0%
+      for (var tndEmp in tndSalesTeamMap) {
+        // skip if same employee already added as RSM
+        if (rsmMap[tndEmp]) continue;
+        repEdit.selectNewLine({ sublistId:'salesteam' });
+        repEdit.setCurrentSublistValue({ sublistId:'salesteam', fieldId:'employee', value: parseInt(tndEmp,10) });
+        repEdit.setCurrentSublistValue({ sublistId:'salesteam', fieldId:'contribution', value: 0 });
+        repEdit.commitLine({ sublistId:'salesteam' });
+      }
+
 
       repEdit.save();
       log.audit('REP UPDATED', 'Line invoices updated + Sales Team updated');
