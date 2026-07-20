@@ -123,25 +123,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
         var inv = record.create({ type: record.Type.INVOICE, isDynamic: true });
 
         inv.setValue({ fieldId:'entity', value: parseInt(data.customer,10) });
-var shipAddressId = getRsmAddressId(data.customer, rsmId);
 
-if (shipAddressId) {
-  inv.setValue({
-    fieldId: 'shipaddresslist',
-    value: parseInt(shipAddressId, 10)
-  });
-
-  log.debug('SHIP ADDRESS SET', {
-    invoiceRsm: rsmId,
-    customerId: data.customer,
-    addressId: shipAddressId
-  });
-} else {
-  log.debug('DEFAULT SHIP ADDRESS KEPT', {
-    invoiceRsm: rsmId,
-    customerId: data.customer
-  });
-}
         inv.setValue({ fieldId:'custbodypm_created_by', value: createdByEmployeeId });
 
         if (!isEmpty(data.subsidiary)) {
@@ -289,45 +271,5 @@ if (shipAddressId) {
     log.audit('END', 'Script Completed');
     return invoiceIds.join(',');
   }
-function getRsmAddressId(customerId, rsmId) {
-
-  var results = search.create({
-    type: search.Type.CUSTOMER,
-    filters: [
-      ['internalid', 'anyof', customerId],
-      'AND',
-      ['address.custrecord_pm_reg_sales_mgr', 'anyof', rsmId]
-    ],
-    columns: [
-      search.createColumn({
-        name: 'internalid',
-        join: 'Address'
-      }),
-      search.createColumn({
-        name: 'custrecord_pm_reg_sales_mgr',
-        join: 'Address'
-      })
-    ]
-  }).run().getRange({
-    start: 0,
-    end: 1
-  });
-
-  var addressId = results.length
-    ? results[0].getValue({
-        name: 'internalid',
-        join: 'Address'
-      })
-    : '';
-
-  log.debug('RSM ADDRESS SEARCH', {
-    customerId: customerId,
-    rsmId: rsmId,
-    resultCount: results.length,
-    matchedAddressId: addressId || 'No matching address'
-  });
-
-  return addressId || null;
-}
   return { onAction: onAction };
 });
