@@ -153,7 +153,7 @@ function getRsmAddressId(customerId, rsmId) {
 
         log.audit('INVOICE START', 'RSM=' + rsmId + ' cust=' + data.customer);
 
-        var inv = record.create({ type: record.Type.INVOICE, isDynamic: false });
+        var inv = record.create({ type: record.Type.INVOICE, isDynamic: true });
 
         inv.setValue({ fieldId:'entity', value: parseInt(data.customer,10) });
 
@@ -242,7 +242,7 @@ if (!isEmpty(addressId)) {
     // ======================================================
     if (invoiceIds.length) {
 
-      var repEdit = record.load({ type: repRec.type, id: repId, isDynamic: false });
+      var repEdit = record.load({ type: repRec.type, id: repId, isDynamic: true });
 
       //  NEW: set status from parameter
       if (!isEmpty(repCommissionStatus)) {
