@@ -27,6 +27,22 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
   }
 
   // ------------------------------------------------------------------
+  // TIMING HELPER - logs how long the PREVIOUS stage took and resets
+  // the clock for the next one. Uses log.audit so it always shows up
+  // regardless of the account's default logging level.
+  // Usage: var timer = makeTimer(); ... timer('SEARCH LINES');
+  // ------------------------------------------------------------------
+  function makeTimer() {
+    var start = Date.now();
+    var last = start;
+    return function(stageLabel) {
+      var now = Date.now();
+      log.audit('TIMER: ' + stageLabel, (now - last) + ' ms (total so far: ' + (now - start) + ' ms)');
+      last = now;
+    };
+  }
+
+  // ------------------------------------------------------------------
   // Batched address lookup: one search per DISTINCT customer, covering
   // every RSM that belongs to that customer in a single call.
   // Returns { rsmId: addressId, ... }
@@ -71,6 +87,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
     var createdByEmployeeId = parseInt(runtime.getCurrentUser().id, 10);
 
     log.audit('START', 'Rep Commission ID: ' + repId);
+    var timer = makeTimer();
 
     var invoiceIds = [];
     var rsmMap = {};     // { rsmId: { customer, location, subsidiary, lines:[{item,qty,rate}] } }
@@ -157,6 +174,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
     });
 
     log.audit('SEARCH COUNT', lineCount);
+    timer('STAGE 1 - Transaction line search + grouping');
 
     if (!lineCount) {
       log.audit('NO LINES', 'No detail lines found for Rep Commission ' + repId);
@@ -185,6 +203,8 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
         log.error('ADDRESS LOOKUP ERROR (customer ' + custIdKey + ')', eAddr);
       }
     }
+
+    timer('STAGE 2 - Batched address lookup (' + Object.keys(customerRsmGroups).length + ' customer search(es))');
 
     // ======================================================
     // CREATE 1 INVOICE PER RSM  (standard/non-dynamic mode)
@@ -253,8 +273,12 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
         inv.setSublistValue({ sublistId:'salesteam', fieldId:'isprimary', line:0, value: true });
         inv.setSublistValue({ sublistId:'salesteam', fieldId:'contribution', line:0, value: 100 });
 
+        timer('  RSM ' + rsmId + ' - build invoice fields/lines (' + data.lines.length + ' line(s))');
+
         var invId = inv.save();
         log.audit('INVOICE CREATED', invId);
+
+        timer('  RSM ' + rsmId + ' - inv.save() call');
 
         invoiceIds.push(invId);
         invByRsm[rsmId] = invId;
@@ -264,6 +288,8 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
       }
     }
 
+    timer('STAGE 3 - All invoices created (' + invoiceIds.length + ' invoice(s))');
+
     // ======================================================
     // UPDATE REP COMMISSION: set invoice on EACH LINE + sales team
     // (standard/non-dynamic mode)
@@ -271,6 +297,7 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
     if (invoiceIds.length) {
 
       var repEdit = record.load({ type: repRec.type, id: repId, isDynamic: false });
+      timer('  Rep Commission - record.load()');
 
       if (!isEmpty(repCommissionStatus)) {
         try {
@@ -325,14 +352,19 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
         stLine++;
       }
 
+      timer('  Rep Commission - build lines/salesteam (' + itemLineCount + ' item line(s))');
+
       repEdit.save();
       log.audit('REP UPDATED', 'Line invoices updated + Sales Team updated');
+
+      timer('STAGE 4 - repEdit.save() call');
 
     } else {
       log.audit('NO INVOICES', 'No invoices created (all lines had amount=0 or missing RSM)');
     }
 
     log.audit('END', 'Script Completed');
+    timer('TOTAL - script end (should match sum of stages above)');
     return invoiceIds.join(',');
   }
   return { onAction: onAction };
