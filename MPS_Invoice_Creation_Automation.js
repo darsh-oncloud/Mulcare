@@ -217,7 +217,11 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
 
         var inv = record.create({ type: record.Type.INVOICE, isDynamic: false });
 
+        timer('  RSM ' + rsmId + ' - record.create() instantiation only');
+
         inv.setValue({ fieldId:'entity', value: parseInt(data.customer,10) });
+
+        timer('  RSM ' + rsmId + ' - setValue(entity) only (sourcing check)');
 
         var addressId = addressMap[rsmId];
         if (!isEmpty(addressId)) {
