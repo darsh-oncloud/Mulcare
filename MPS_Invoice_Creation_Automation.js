@@ -1,6 +1,22 @@
 /**
  * @NApiVersion 2.1
  * @NScriptType WorkflowActionScript
+ *
+ * OPTIMIZATION NOTES (vs original):
+ * 1. Address lookups are now BATCHED per distinct customer instead of run
+ *    once per RSM. If several RSMs share a customer, this collapses N
+ *    searches into 1 search per unique customer.
+ * 2. Invoice creation and Rep Commission edit now use STANDARD mode
+ *    (isDynamic:false) with setSublistValue/insertLine/removeLine instead
+ *    of dynamic mode's selectNewLine/setCurrentSublistValue/commitLine.
+ *    Dynamic mode re-sources/recalculates the record after every single
+ *    field set - standard mode skips that entirely, which is the biggest
+ *    speed gain when a record has several lines.
+ * 3. Removed the extra runPaged().count() search - it was a second round
+ *    trip to the search index used only for a log line. Count is now
+ *    tracked while iterating the results we already have.
+ * 4. Reduced per-line log.debug calls and removed full JSON.stringify of
+ *    the whole map on every run - logging has real overhead when enabled.
  */
 define(['N/record','N/search','N/log','N/runtime'], function(record, search, log, runtime) {
 
@@ -10,39 +26,44 @@ define(['N/record','N/search','N/log','N/runtime'], function(record, search, log
     return isNaN(n) ? 0 : n;
   }
 
-function getRsmAddressId(customerId, rsmId) {
+  // ------------------------------------------------------------------
+  // Batched address lookup: one search per DISTINCT customer, covering
+  // every RSM that belongs to that customer in a single call.
+  // Returns { rsmId: addressId, ... }
+  // ------------------------------------------------------------------
+  function getAddressMapForCustomer(customerId, rsmIds) {
 
-  var addressIdColumn = search.createColumn({
-    name: 'addressinternalid',
-    join: 'Address'
-  });
+    var addressIdColumn = search.createColumn({ name: 'addressinternalid', join: 'Address' });
+    var rsmColumn = search.createColumn({ name: 'custrecord_pm_reg_sales_mgr', join: 'Address' });
 
-  var results = search.create({
-    type: search.Type.CUSTOMER,
-    filters: [
-      ['internalidnumber', 'equalto', String(customerId)],
-      'AND',
-      ['address.custrecord_pm_reg_sales_mgr', 'anyof', String(rsmId)]
-    ],
-    columns: [addressIdColumn]
-  }).run().getRange({
-    start: 0,
-    end: 1
-  });
+    var results = search.create({
+      type: search.Type.CUSTOMER,
+      filters: [
+        ['internalidnumber', 'equalto', String(customerId)],
+        'AND',
+        ['address.custrecord_pm_reg_sales_mgr', 'anyof', rsmIds]
+      ],
+      columns: [addressIdColumn, rsmColumn]
+    }).run().getRange({ start: 0, end: 1000 });
 
-  var addressId = results.length
-    ? results[0].getValue(addressIdColumn)
-    : '';
+    var map = {};
+    for (var i = 0; i < results.length; i++) {
+      var addrId = results[i].getValue(addressIdColumn);
+      var rsmRaw = results[i].getValue(rsmColumn);
+      if (isEmpty(rsmRaw) || isEmpty(addrId)) continue;
 
-  log.debug('RSM ADDRESS RESULT', {
-    customerId: customerId,
-    rsmId: rsmId,
-    addressId: addressId || 'No matching address'
-  });
+      // handle both single-select and comma-separated multi-select values
+      var ids = String(rsmRaw).split(',');
+      for (var k = 0; k < ids.length; k++) {
+        var idTrim = ids[k].trim();
+        if (idTrim) map[idTrim] = addrId;
+      }
+    }
 
-  return addressId;
-}
-  
+    log.debug('ADDRESS MAP (customer ' + customerId + ')', map);
+    return map;
+  }
+
   function onAction(context) {
 
     var repRec = context.newRecord;
@@ -54,11 +75,10 @@ function getRsmAddressId(customerId, rsmId) {
     var invoiceIds = [];
     var rsmMap = {};     // { rsmId: { customer, location, subsidiary, lines:[{item,qty,rate}] } }
     var invByRsm = {};   //  { rsmId : invoiceId }
-    
-    // NEW: collect T&D Manager employees for sales team
-    var tndSalesTeamMap = {};    
 
-    //  NEW: get status from parameter
+    // T&D Manager employees for sales team
+    var tndSalesTeamMap = {};
+
     var repCommissionStatus = runtime.getCurrentScript().getParameter({
       name: 'custscript_rep_commission_status'
     });
@@ -98,15 +118,11 @@ function getRsmAddressId(customerId, rsmId) {
       ]
     });
 
-    var cnt = s.runPaged().count;
-    log.audit('SEARCH COUNT', cnt);
-
-    if (!cnt) {
-      log.audit('NO LINES', 'No detail lines found for Rep Commission ' + repId);
-      return '';
-    }
+    var lineCount = 0;
 
     s.run().each(function(r){
+
+      lineCount++;
 
       var customer   = r.getValue({ name:'entity' });
       var subsidiary = r.getValue({ name:'subsidiary' });
@@ -119,12 +135,10 @@ function getRsmAddressId(customerId, rsmId) {
       var amount     = toNum(r.getValue({ name:'formulanumeric' })) || 0;
       var repSalesAmount = toNum(r.getValue({ name: 'amount' }));
 
-      log.debug('LINE', { customer:customer, subsidiary:subsidiary, location:locationId, item:item, qty:qty, rsm:rsm,tndManager:tndManager,tndSalesTeam:tndSalesTeam, amount:amount });
-
       if (!isEmpty(tndSalesTeam)) {
         tndSalesTeamMap[tndSalesTeam] = true;
       }
-      
+
       if (isEmpty(customer) || isEmpty(item) || isEmpty(rsm) || !amount) return true;
 
       if (!rsmMap[rsm]) {
@@ -142,10 +156,38 @@ function getRsmAddressId(customerId, rsmId) {
       return true;
     });
 
-    log.audit('GROUP RESULT', JSON.stringify(rsmMap));
-    log.audit('TND SALES TEAM RESULT', JSON.stringify(tndSalesTeamMap));
+    log.audit('SEARCH COUNT', lineCount);
+
+    if (!lineCount) {
+      log.audit('NO LINES', 'No detail lines found for Rep Commission ' + repId);
+      return '';
+    }
+
+    log.audit('RSM GROUPS', Object.keys(rsmMap).length + ' RSM(s) found');
+
     // ======================================================
-    // CREATE 1 INVOICE PER RSM
+    // BATCH ADDRESS LOOKUP: group RSMs by customer so we run
+    // one address search per distinct customer, not per RSM.
+    // ======================================================
+    var customerRsmGroups = {}; // { customerId: [rsmId, ...] }
+    for (var rsmKey in rsmMap) {
+      var custId = rsmMap[rsmKey].customer;
+      if (!customerRsmGroups[custId]) customerRsmGroups[custId] = [];
+      customerRsmGroups[custId].push(rsmKey);
+    }
+
+    var addressMap = {}; // { rsmId: addressId }
+    for (var custIdKey in customerRsmGroups) {
+      try {
+        var partialMap = getAddressMapForCustomer(custIdKey, customerRsmGroups[custIdKey]);
+        for (var mapKey in partialMap) addressMap[mapKey] = partialMap[mapKey];
+      } catch (eAddr) {
+        log.error('ADDRESS LOOKUP ERROR (customer ' + custIdKey + ')', eAddr);
+      }
+    }
+
+    // ======================================================
+    // CREATE 1 INVOICE PER RSM  (standard/non-dynamic mode)
     // ======================================================
     for (var rsmId in rsmMap) {
       try {
@@ -153,21 +195,15 @@ function getRsmAddressId(customerId, rsmId) {
 
         log.audit('INVOICE START', 'RSM=' + rsmId + ' cust=' + data.customer);
 
-        var inv = record.create({ type: record.Type.INVOICE, isDynamic: true });
+        var inv = record.create({ type: record.Type.INVOICE, isDynamic: false });
 
         inv.setValue({ fieldId:'entity', value: parseInt(data.customer,10) });
 
-var addressId = getRsmAddressId(data.customer, rsmId);
+        var addressId = addressMap[rsmId];
+        if (!isEmpty(addressId)) {
+          inv.setValue({ fieldId: 'shipaddresslist', value: String(addressId) });
+        }
 
-// Set matching address; otherwise keep default shipping address
-if (!isEmpty(addressId)) {
-  inv.setValue({
-    fieldId: 'shipaddresslist',
-    value: String(addressId)
-  });
-}
-
-        
         inv.setValue({ fieldId:'custbodypm_created_by', value: createdByEmployeeId });
 
         if (!isEmpty(data.subsidiary)) {
@@ -183,54 +219,45 @@ if (!isEmpty(addressId)) {
         // Link back to Rep Commission
         inv.setValue({ fieldId:'custbody_related_rep_commission', value: repId });
 
-        // Lines
+        // Lines - standard mode: insertLine + setSublistValue (no recalc per field)
         for (var j=0; j<data.lines.length; j++){
           var ln = data.lines[j];
 
-          inv.selectNewLine({ sublistId:'item' });
-          inv.setCurrentSublistValue({ sublistId:'item', fieldId:'item', value: parseInt(ln.item,10) });
-          inv.setCurrentSublistValue({ sublistId:'item', fieldId:'price', value: -1 }); // custom price
-          inv.setCurrentSublistValue({ sublistId:'item', fieldId:'quantity', value: ln.qty });
-          inv.setCurrentSublistValue({ sublistId:'item', fieldId:'rate', value: ln.rate });
-          inv.setCurrentSublistValue({ sublistId:'item', fieldId:'custcol_snp_rep_sales_amount', value: ln.repSalesAmount });
+          inv.insertLine({ sublistId:'item', line:j });
+          inv.setSublistValue({ sublistId:'item', fieldId:'item', line:j, value: parseInt(ln.item,10) });
+          inv.setSublistValue({ sublistId:'item', fieldId:'price', line:j, value: -1 }); // custom price
+          inv.setSublistValue({ sublistId:'item', fieldId:'quantity', line:j, value: ln.qty });
+          inv.setSublistValue({ sublistId:'item', fieldId:'rate', line:j, value: ln.rate });
+          inv.setSublistValue({ sublistId:'item', fieldId:'custcol_snp_rep_sales_amount', line:j, value: ln.repSalesAmount });
 
-          // Pass T&D Manager from Rep Commission line to Invoice line
           if (!isEmpty(ln.tndManager)) {
             try {
-              inv.setCurrentSublistValue({
-                sublistId:'item',
-                fieldId:'custcol_tnd_commission',
-                value: parseInt(ln.tndManager,10)
-              });
-            } catch(eTnd) {
+              inv.setSublistValue({ sublistId:'item', fieldId:'custcol_tnd_commission', line:j, value: parseInt(ln.tndManager,10) });
+            } catch (eTnd) {
               log.error('T&D MANAGER LINE SET ERROR', eTnd);
             }
           }
 
-          // line location (safe)
-          try { inv.setCurrentSublistValue({ sublistId:'item', fieldId:'location', value: parseInt(data.location,10) }); } catch(e){}
-
-          inv.commitLine({ sublistId:'item' });
+          try { inv.setSublistValue({ sublistId:'item', fieldId:'location', line:j, value: parseInt(data.location,10) }); } catch(e){}
         }
 
-        //  Fix sales team total 200%: remove auto-added lines first
+        // Fix sales team total 200%: remove any auto-added lines first (cheap in standard mode)
         var stCount = inv.getLineCount({ sublistId:'salesteam' });
         for (var x = stCount - 1; x >= 0; x--) {
           inv.removeLine({ sublistId:'salesteam', line:x, ignoreRecalc:true });
         }
 
         // Add ONLY RSM at 100%
-        inv.selectNewLine({ sublistId:'salesteam' });
-        inv.setCurrentSublistValue({ sublistId:'salesteam', fieldId:'employee', value: parseInt(rsmId,10) });
-        inv.setCurrentSublistValue({ sublistId:'salesteam', fieldId:'isprimary', value: true });
-        inv.setCurrentSublistValue({ sublistId:'salesteam', fieldId:'contribution', value: 100 });
-        inv.commitLine({ sublistId:'salesteam' });
+        inv.insertLine({ sublistId:'salesteam', line:0 });
+        inv.setSublistValue({ sublistId:'salesteam', fieldId:'employee', line:0, value: parseInt(rsmId,10) });
+        inv.setSublistValue({ sublistId:'salesteam', fieldId:'isprimary', line:0, value: true });
+        inv.setSublistValue({ sublistId:'salesteam', fieldId:'contribution', line:0, value: 100 });
 
         var invId = inv.save();
         log.audit('INVOICE CREATED', invId);
 
         invoiceIds.push(invId);
-        invByRsm[rsmId] = invId; //  store mapping
+        invByRsm[rsmId] = invId;
 
       } catch (eInv) {
         log.error('INVOICE ERROR (RSM ' + rsmId + ')', eInv);
@@ -239,24 +266,21 @@ if (!isEmpty(addressId)) {
 
     // ======================================================
     // UPDATE REP COMMISSION: set invoice on EACH LINE + sales team
+    // (standard/non-dynamic mode)
     // ======================================================
     if (invoiceIds.length) {
 
-      var repEdit = record.load({ type: repRec.type, id: repId, isDynamic: true });
+      var repEdit = record.load({ type: repRec.type, id: repId, isDynamic: false });
 
-      //  NEW: set status from parameter
       if (!isEmpty(repCommissionStatus)) {
         try {
-          repEdit.setValue({
-            fieldId: 'transtatus',
-            value: repCommissionStatus
-          });
+          repEdit.setValue({ fieldId: 'transtatus', value: repCommissionStatus });
         } catch (eStatus) {
           log.error('STATUS UPDATE ERROR', eStatus);
         }
       }
 
-      //  Set custcol_related_invoice on each line (dynamic mode)
+      // Set custcol_related_invoice on each line - direct sublist write, no line selection needed
       var itemLineCount = repEdit.getLineCount({ sublistId: 'item' });
 
       for (var i2 = 0; i2 < itemLineCount; i2++) {
@@ -270,40 +294,36 @@ if (!isEmpty(addressId)) {
         var lineInv = invByRsm[lineRsm];
 
         if (!isEmpty(lineRsm) && !isEmpty(lineInv)) {
-
-          repEdit.selectLine({ sublistId: 'item', line: i2 });
-
-          repEdit.setCurrentSublistValue({
+          repEdit.setSublistValue({
             sublistId: 'item',
             fieldId: 'custcol_related_invoice',
+            line: i2,
             value: parseInt(lineInv, 10)
           });
-
-          repEdit.commitLine({ sublistId: 'item' });
         }
       }
 
-      // Clear & re-add sales team on rep commission record (as you had)
+      // Clear & re-add sales team on rep commission record
       var repStCount = repEdit.getLineCount({ sublistId:'salesteam' });
       for (var rr = repStCount - 1; rr >= 0; rr--) {
         repEdit.removeLine({ sublistId:'salesteam', line: rr, ignoreRecalc:true });
       }
 
+      var stLine = 0;
       for (var rsm3 in rsmMap) {
-        repEdit.selectNewLine({ sublistId:'salesteam' });
-        repEdit.setCurrentSublistValue({ sublistId:'salesteam', fieldId:'employee', value: parseInt(rsm3,10) });
-        repEdit.commitLine({ sublistId:'salesteam' });
-      }
-      // NEW: add T&D Manager employees with 0%
-      for (var tndEmp in tndSalesTeamMap) {
-        // skip if same employee already added as RSM
-        if (rsmMap[tndEmp]) continue;
-        repEdit.selectNewLine({ sublistId:'salesteam' });
-        repEdit.setCurrentSublistValue({ sublistId:'salesteam', fieldId:'employee', value: parseInt(tndEmp,10) });
-        repEdit.setCurrentSublistValue({ sublistId:'salesteam', fieldId:'contribution', value: 0 });
-        repEdit.commitLine({ sublistId:'salesteam' });
+        repEdit.insertLine({ sublistId:'salesteam', line: stLine });
+        repEdit.setSublistValue({ sublistId:'salesteam', fieldId:'employee', line: stLine, value: parseInt(rsm3,10) });
+        stLine++;
       }
 
+      // Add T&D Manager employees with 0%
+      for (var tndEmp in tndSalesTeamMap) {
+        if (rsmMap[tndEmp]) continue; // skip if already added as RSM
+        repEdit.insertLine({ sublistId:'salesteam', line: stLine });
+        repEdit.setSublistValue({ sublistId:'salesteam', fieldId:'employee', line: stLine, value: parseInt(tndEmp,10) });
+        repEdit.setSublistValue({ sublistId:'salesteam', fieldId:'contribution', line: stLine, value: 0 });
+        stLine++;
+      }
 
       repEdit.save();
       log.audit('REP UPDATED', 'Line invoices updated + Sales Team updated');
